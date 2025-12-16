@@ -1,278 +1,128 @@
+# src/train.py
+import mlflow
+import mlflow.sklearn
+from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
+from sklearn.metrics import (
+    accuracy_score, precision_score, recall_score,
+    f1_score, roc_auc_score
+)
 import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
+import joblib
+import os
 
-def load_data(file_path):
-    """Load the dataset from a CSV file."""
-    return pd.read_csv(file_path, index_col=False)
+from src.config import PROCESSED_PATH, RANDOM_STATE
 
-def data_overview(df):
-    """Provide an overview of the dataset."""
-    print("Dataset Shape:", df.shape)
-    print("\nColumn Names:", df.columns.tolist())
-    print("\nData Types:")
-    print(df.dtypes)
-    print("\nMissing Values:")
-    print(df.isnull().sum())
+# MLflow setup
+mlflow.set_tracking_uri("mlruns")  # Local folder
+mlflow.set_experiment("credit_risk_proxy_model")
 
-def summary_statistics(df):
-    """Calculate and return summary statistics for numerical columns."""
-    return df.describe()
+# Load processed data
+df = pd.read_csv(PROCESSED_PATH)
+print(f"Loaded processed data: {df.shape}")
 
-def plot_numerical_distributions(df):
-    """Plot distributions of numerical features."""
-    numerical_cols = df.select_dtypes(include=['int64', 'float64']).columns
-    n_cols = 2
-    n_rows = (len(numerical_cols) + 1) // 2  # ensure enough rows for all plots
-    
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 5*n_rows))
-    axes = axes.flatten()
+# Features and target
+X = df.drop('is_high_risk', axis=1)
+y = df['is_high_risk']
 
-    for i, col in enumerate(numerical_cols):
-        sns.histplot(df[col], kde=True, ax=axes[i], color='blue')
-        axes[i].set_title(f'Distribution of {col}')
-        axes[i].set_xlabel(col)
-        axes[i].set_ylabel('Count')
-    
-    for j in range(i + 1, len(axes)):
-        fig.delaxes(axes[j])
+# Train-test split
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, random_state=RANDOM_STATE, stratify=y
+)
 
-    plt.tight_layout()
-    plt.show()
+print(f"Train: {X_train.shape}, Test: {X_test.shape}")
+print(f"Target distribution in train: {y_train.mean():.3f}")
 
+# Models and hyperparameter grids
+models = {
+    "LogisticRegression": {
+        "model": LogisticRegression(max_iter=1000),
+        "params": {
+            "C": [0.01, 0.1, 1, 10],
+            "penalty": ["l1", "l2"],
+            "solver": ["liblinear"]
+        }
+    },
+    "RandomForest": {
+        "model": RandomForestClassifier(random_state=RANDOM_STATE),
+        "params": {
+            "n_estimators": [100, 200],
+            "max_depth": [10, 20, None],
+            "min_samples_split": [2, 5]
+        }
+    },
+    "XGBoost": {
+        "model": XGBClassifier(eval_metric='logloss', random_state=RANDOM_STATE),
+        "params": {
+            "n_estimators": [100, 200],
+            "max_depth": [6, 10],
+            "learning_rate": [0.01, 0.1],
+            "subsample": [0.8, 1.0]
+        }
+    }
+}
 
-def plot_categorical_distributions(df, columns):
-    """Plot distributions of specified categorical features."""
-    categorical_cols = [col for col in columns if df[col].dtype == 'object']  # Filter only categorical columns
-    n_cols = 2
-    n_rows = (len(categorical_cols) + 1) // 2  # ensure enough rows for all plots
-    
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 5*n_rows))
-    axes = axes.flatten()
+best_auc = 0
+best_model_name = None
+best_run_id = None
 
-    for i, col in enumerate(categorical_cols):
-        df[col].value_counts().plot(kind='bar', ax=axes[i])
-        axes[i].set_title(f'Distribution of {col}')
-        axes[i].set_xlabel(col)
-        axes[i].set_ylabel('Count')
-        axes[i].tick_params(axis='x', rotation=45)
+for name, config in models.items():
+    print(f"\nTraining {name}...")
+    with mlflow.start_run(run_name=name):
+        # Hyperparameter tuning with GridSearchCV
+        grid = GridSearchCV(
+            config["model"],
+            config["params"],
+            cv=5,
+            scoring='roc_auc',
+            n_jobs=-1
+        )
+        grid.fit(X_train, y_train)
 
-    for j in range(i + 1, len(axes)):
-        fig.delaxes(axes[j])
+        # Best estimator
+        best_estimator = grid.best_estimator_
 
-    plt.tight_layout()
-    plt.show()
+        # Predictions
+        y_pred = best_estimator.predict(X_test)
+        y_prob = best_estimator.predict_proba(X_test)[:, 1]
 
+        # Metrics
+        metrics = {
+            "accuracy": accuracy_score(y_test, y_pred),
+            "precision": precision_score(y_test, y_pred),
+            "recall": recall_score(y_test, y_pred),
+            "f1": f1_score(y_test, y_pred),
+            "roc_auc": roc_auc_score(y_test, y_prob)
+        }
 
-def correlation_analysis(df):
-    """Perform correlation analysis on numerical features."""
-    numerical_cols = df.select_dtypes(include=['int64', 'float64']).columns
-    corr_matrix = df[numerical_cols].corr()
+        # Log to MLflow
+        mlflow.log_params(grid.best_params_)
+        mlflow.log_metrics(metrics)
+        mlflow.sklearn.log_model(best_estimator, "model")
 
-    plt.figure(figsize=(12, 10))
-    sns.heatmap(corr_matrix, annot=True, cmap='coolwarm', linewidths=0.5)
-    plt.title('Correlation Matrix of Numerical Features')
-    plt.show()
+        print(f"{name} - Best ROC-AUC: {metrics['roc_auc']:.4f}")
 
-def detect_outliers(df):
-    """Detect outliers using box plots for numerical features."""
-    numerical_cols = df.select_dtypes(include=['int64', 'float64']).columns
-    n_cols = 2
-    n_rows = (len(numerical_cols) + 1) // 2
-    
-    fig, axes = plt.subplots(n_rows, n_cols, figsize=(15, 5*n_rows))
-    axes = axes.flatten()
+        # Track best model
+        if metrics['roc_auc'] > best_auc:
+            best_auc = metrics['roc_auc']
+            best_model_name = name
+            best_run_id = mlflow.active_run().info.run_id
 
-    for i, col in enumerate(numerical_cols):
-        sns.boxplot(x=df[col], ax=axes[i])
-        axes[i].set_title(f'Box Plot of {col}')
-        axes[i].set_xlabel(col)
-    
-    # Remove unused axes 
-    for j in range(i + 1, len(axes)):
-        fig.delaxes(axes[j])
+            # Save best model locally
+            os.makedirs("models", exist_ok=True)
+            joblib.dump(best_estimator, f"models/best_model_{name}.pkl")
 
-    plt.tight_layout()
-    plt.show()
+print(f"\nBest model: {best_model_name} with ROC-AUC = {best_auc:.4f}")
 
+# Register best model in MLflow Registry
+with mlflow.start_run(run_id=best_run_id):
+    mlflow.register_model(f"runs:/{best_run_id}/model", "CreditRiskProxyBest")
 
+print("Best model registered in MLflow Model Registry as 'CreditRiskProxyBest'")
 
-def bivariate_analysis(df):
-    """
-    Perform bivariate analysis and generate related plots.
-    """
-    # 1. Amount vs Product Category
-    plt.figure(figsize=(12, 6))
-    sns.boxplot(x='ProductCategory', y='Amount', data=df)
-    plt.title('Transaction Amount by Product Category')
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    plt.show()
-    plt.close()
-
-    # 2. Fraud Analysis
-    # Fraud vs ProductCategory
-    fraud_rate = df.groupby('ProductCategory')['FraudResult'].mean()
-    plt.figure(figsize=(12, 6))
-    fraud_rate.sort_values(ascending=False).plot(kind='bar')
-    plt.title('Fraud Rate by Product Category')
-    plt.ylabel('Fraud Rate')
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    plt.show()
-    plt.close()
-
-    # 3. Fraud vs Amount
-    plt.figure(figsize=(10, 6))
-    sns.boxplot(x='FraudResult', y='Amount', data=df)
-    plt.title('Transaction Amount for Fraudulent vs Non-Fraudulent Transactions')
-    plt.tight_layout()
-    plt.show()
-    plt.close()
-
-    # 4. ChannelId vs Amount
-    channel_avg_amount = df.groupby('ChannelId')['Amount'].mean().sort_values(ascending=False)
-    plt.figure(figsize=(10, 6))
-    channel_avg_amount.plot(kind='bar')
-    plt.title('Average Transaction Amount by Channel')
-    plt.ylabel('Average Amount')
-    plt.xticks(rotation=45)
-    plt.tight_layout()
-    plt.show()
-    plt.close()
-
-    # 5. Customer Analysis
-    customer_transactions = df.groupby('CustomerId')['Amount'].agg(['count', 'sum', 'mean'])
-    customer_transactions = customer_transactions.sort_values('sum', ascending=False)
-
-    plt.figure(figsize=(12, 6))
-    plt.scatter(customer_transactions['count'], customer_transactions['sum'])
-    plt.title('Customer Transaction Count vs Total Amount')
-    plt.xlabel('Number of Transactions')
-    plt.ylabel('Total Transaction Amount')
-    plt.show()
-    plt.close()
-
-    # 6. Transaction Amount Analysis
-    plt.figure(figsize=(10, 6))
-    sns.scatterplot(x='TransactionStartTime', y='Amount', data=df)
-    plt.title('Transaction Amount over Time')
-    plt.xlabel('Transaction Start Time')
-    plt.ylabel('Amount')
-    plt.xticks(rotation=45)
-    plt.show()
-    plt.close()
-
-
-def multivariate_analysis(df):
-    """
-    Perform multivariate analysis and generate related plots.
-    """
-    # 1. Fraud Analysis across Multiple Features
-    # Fraud by Product Category and Channel
-    fraud_by_category_channel = df.groupby(['ProductCategory', 'ChannelId'])['FraudResult'].mean().unstack()
-    plt.figure(figsize=(14, 8))
-    sns.heatmap(fraud_by_category_channel, annot=True, cmap='YlOrRd')
-    plt.title('Fraud Rate by Product Category and Channel')
-    plt.tight_layout()
-    plt.show()
-    plt.close()
-
-    # 2. Fraud by Date and Amount
-    df['Date'] = df['TransactionStartTime'].dt.date
-    fraud_by_date = df.groupby('Date').agg({'FraudResult': 'mean', 'Amount': 'mean'})
-    fig, ax1 = plt.subplots(figsize=(12, 6))
-    ax2 = ax1.twinx()
-    ax1.plot(fraud_by_date.index, fraud_by_date['FraudResult'], 'g-', label='Fraud Rate')
-    ax2.plot(fraud_by_date.index, fraud_by_date['Amount'], 'b-', label='Average Amount')
-    ax1.set_xlabel('Date')
-    ax1.set_ylabel('Fraud Rate', color='g')
-    ax2.set_ylabel('Average Amount', color='b')
-    plt.title('Fraud Rate and Average Amount Over Time')
-    fig.legend(loc="upper left", bbox_to_anchor=(0.1,0.9), bbox_transform=ax1.transAxes)
-    plt.tight_layout()
-    plt.show()
-    plt.close()
-
-
-    # 3. Product Category, Amount, and Fraud Interaction
-    fig = plt.figure(figsize=(12, 8))
-    ax = fig.add_subplot(111, projection='3d')
-    categories = df['ProductCategory'].unique()
-    colors = plt.cm.rainbow(np.linspace(0, 1, len(categories)))
-    for category, color in zip(categories, colors):
-        category_data = df[df['ProductCategory'] == category]
-        ax.scatter(category_data['Amount'], category_data['FraudResult'], 
-                   category_data.index, c=[color], label=category, alpha=0.6)
-    ax.set_xlabel('Amount')
-    ax.set_ylabel('Fraud Result')
-    ax.set_zlabel('Transaction Index')
-    plt.title('3D Scatter Plot: Amount, Fraud, and Product Category')
-    plt.legend()
-    plt.tight_layout()
-    plt.show()
-    plt.close()
-
-
-def time_series_analysis(df):
-    """
-    Perform time series analysis and generate related plots.
-    """
-    # daily transaction volume
-    df['TransactionStartTime'] = pd.to_datetime(df['TransactionStartTime'])
-    df['Date'] = df['TransactionStartTime'].dt.date
-    daily_transactions = df.groupby('Date')['Amount'].sum().reset_index()
-
-    plt.figure(figsize=(12, 6))
-    plt.plot(daily_transactions['Date'], daily_transactions['Amount'])
-    plt.title('Daily Transaction Volume')
-    plt.xlabel('Date')
-    plt.ylabel('Total Amount')
-    plt.xticks(rotation=45)
-    plt.show()
-    plt.close()
-
-    
-    # Time of Day Analysis
-    df['Hour'] = df['TransactionStartTime'].dt.hour
-    hourly_transactions = df.groupby('Hour').size()
-    plt.figure(figsize=(12, 6))
-    hourly_transactions.plot(kind='bar')
-    plt.title('Number of Transactions by Hour of Day')
-    plt.xlabel('Hour')
-    plt.ylabel('Number of Transactions')
-    plt.tight_layout()
-    plt.show()
-    plt.close()
-
-    # Day of the Week Analysis
-    df['DayOfWeek'] = df['TransactionStartTime'].dt.dayofweek
-    daily_transactions = df.groupby('DayOfWeek').size()
-    plt.figure(figsize=(10, 6))
-    daily_transactions.plot(kind='bar')
-    plt.title('Number of Transactions by Day of Week')
-    plt.xlabel('Day of Week (0=Monday, 6=Sunday)')
-    plt.ylabel('Number of Transactions')
-    plt.tight_layout()
-    plt.show()
-    plt.close()
-
-    # Trend Analysis
-    monthly_transactions = df.groupby(df['TransactionStartTime'].dt.to_period('M')).agg({
-        'TransactionId': 'count',
-        'Amount': 'sum'
-    })
-    fig, ax1 = plt.subplots(figsize=(12, 6))
-    ax2 = ax1.twinx()
-    ax1.plot(monthly_transactions.index.astype(str), monthly_transactions['TransactionId'], 'g-', label='Number of Transactions')
-    ax2.plot(monthly_transactions.index.astype(str), monthly_transactions['Amount'], 'b-', label='Total Amount')
-    ax1.set_xlabel('Month')
-    ax1.set_ylabel('Number of Transactions', color='g')
-    ax2.set_ylabel('Total Amount', color='b')
-    plt.title('Monthly Transaction Volume and Total Amount')
-    plt.xticks(rotation=45)
-    fig.legend(loc="upper left", bbox_to_anchor=(0.1,0.9), bbox_transform=ax1.transAxes)
-    plt.tight_layout()
-    plt.show()
-    plt.close()
+# Start MLflow UI to compare runs
+print("\nTo view experiments, run:")
+print("mlflow ui")
+print("Then open http://localhost:5000")
